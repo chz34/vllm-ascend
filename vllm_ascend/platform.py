@@ -488,7 +488,28 @@ class NPUPlatform(Platform):
 
         compilation_config.cudagraph_num_of_warmups = 1
 
-        if compilation_config.mode not in [CompilationMode.NONE, CompilationMode.VLLM_COMPILE]:
+        # When fxrt is explicitly enabled (VLLM_ASCEND_ENABLE_FXRT_BACKEND=1),
+        # keep direct Dynamo modes for FX graph capture. vLLM wraps the
+        # configured backend and delegates the captured graph to fxrt; the
+        # "inductor" name is only retained for config validation and is never
+        # lowered through Triton Inductor.
+        direct_fx_backend_modes = (
+            CompilationMode.STOCK_TORCH_COMPILE,
+            CompilationMode.DYNAMO_TRACE_ONCE,
+        )
+        from vllm_ascend import envs as ascend_envs
+
+        fxrt_backend_enabled = ascend_envs.VLLM_ASCEND_ENABLE_FXRT_BACKEND
+        external_fx_backend = (
+            compilation_config.mode in direct_fx_backend_modes
+            and compilation_config.backend == "inductor"
+            and compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+            and fxrt_backend_enabled
+        )
+        if not external_fx_backend and compilation_config.mode not in [
+            CompilationMode.NONE,
+            CompilationMode.VLLM_COMPILE,
+        ]:
             logger.warning(
                 "NPU does not support compilation mode. mode=%s, action: setting CUDAGraphMode to NONE.",
                 compilation_config.mode,
@@ -547,8 +568,12 @@ class NPUPlatform(Platform):
 
         compilation_config.use_inductor = False
         if compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
-            compilation_config.mode = CompilationMode.NONE
+            if not external_fx_backend:
+                compilation_config.mode = CompilationMode.NONE
             ascend_config.ascend_compilation_config.enable_npugraph_ex = False
+            if external_fx_backend:
+                ascend_config.ascend_compilation_config.enable_static_kernel = False
+                vllm_config.additional_config["ascend_compilation_config"]["enable_static_kernel"] = False
         elif compilation_config.cudagraph_mode.requires_piecewise_compilation():
             # Our is_cuda_alike is False so we cannot reuse the assertion of upstream
             assert compilation_config.mode == CompilationMode.VLLM_COMPILE, (

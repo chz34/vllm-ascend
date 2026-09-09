@@ -3560,6 +3560,29 @@ class NPUModelRunner(GPUModelRunner):
                 backend = wrap_backend_with_fx_dump(
                     backend, dump_dir, "model"
                 )
+            elif ascend_envs.VLLM_ASCEND_ENABLE_INDUCTOR_ASCENDC:
+                from vllm_ascend.compilation.ascendc_inductor import (
+                    enable_ascendc_inductor_backend,
+                )
+
+                logger.info(
+                    "Routing STOCK_TORCH_COMPILE prefill through stock "
+                    "torch._inductor with the inductor_npu_ext AscendC fusion "
+                    "codegen (Triton-on-NPU backend is overridden)"
+                )
+                enable_ascendc_inductor_backend()
+            elif ascend_envs.VLLM_ASCEND_ENABLE_INDUCTOR_FXRT:
+                from vllm_ascend.compilation.ascendc_inductor import (
+                    enable_inductor_fxrt_fx_wrapper,
+                )
+
+                logger.info(
+                    "Routing STOCK_TORCH_COMPILE prefill through stock "
+                    "torch._inductor (inductor_npu_ext AscendC fusion); the "
+                    "fxrt fx_wrapper re-emits the lowered graph to host FX "
+                    "and executes it via the fxrt runtime"
+                )
+                enable_inductor_fxrt_fx_wrapper()
             self._stock_compiled_call = torch.compile(
                 self.model._call_impl,
                 fullgraph=True,

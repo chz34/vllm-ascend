@@ -488,23 +488,33 @@ class NPUPlatform(Platform):
 
         compilation_config.cudagraph_num_of_warmups = 1
 
-        # When fxrt is explicitly enabled (VLLM_ASCEND_ENABLE_FXRT_BACKEND=1),
-        # keep direct Dynamo modes for FX graph capture. vLLM wraps the
-        # configured backend and delegates the captured graph to fxrt; the
-        # "inductor" name is only retained for config validation and is never
-        # lowered through Triton Inductor.
+        # Keep direct Dynamo modes for FX graph capture when an external
+        # prefill backend is selected:
+        #   - VLLM_ASCEND_ENABLE_FXRT_BACKEND=1: vLLM wraps the configured
+        #     backend and delegates the captured graph to fxrt; the "inductor"
+        #     name is only retained for config validation.
+        #   - VLLM_ASCEND_ENABLE_INDUCTOR_ASCENDC=1: stock torch._inductor
+        #     stays in control but the "npu" device codegen is overridden to
+        #     inductor_npu_ext's AscendC fusion kernels (instead of Triton).
+        #   - VLLM_ASCEND_ENABLE_INDUCTOR_FXRT=1: like the AscendC path, but
+        #     inductor's fx_wrapper codegen re-emits the lowered program as a
+        #     host FX graph that is executed by the fxrt runtime.
         direct_fx_backend_modes = (
             CompilationMode.STOCK_TORCH_COMPILE,
             CompilationMode.DYNAMO_TRACE_ONCE,
         )
         from vllm_ascend import envs as ascend_envs
 
-        fxrt_backend_enabled = ascend_envs.VLLM_ASCEND_ENABLE_FXRT_BACKEND
+        external_backend_enabled = (
+            ascend_envs.VLLM_ASCEND_ENABLE_FXRT_BACKEND
+            or ascend_envs.VLLM_ASCEND_ENABLE_INDUCTOR_ASCENDC
+            or ascend_envs.VLLM_ASCEND_ENABLE_INDUCTOR_FXRT
+        )
         external_fx_backend = (
             compilation_config.mode in direct_fx_backend_modes
             and compilation_config.backend == "inductor"
             and compilation_config.cudagraph_mode == CUDAGraphMode.NONE
-            and fxrt_backend_enabled
+            and external_backend_enabled
         )
         if not external_fx_backend and compilation_config.mode not in [
             CompilationMode.NONE,

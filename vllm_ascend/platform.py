@@ -488,7 +488,21 @@ class NPUPlatform(Platform):
 
         compilation_config.cudagraph_num_of_warmups = 1
 
-        if compilation_config.mode not in [CompilationMode.NONE, CompilationMode.VLLM_COMPILE]:
+        # Keep direct Dynamo modes for FX graph capture when fxrt is selected.
+        # vLLM keeps the "inductor" name only for config validation; the
+        # model runner delegates the captured graph directly to fxrt.
+        from vllm_ascend import envs as ascend_envs
+
+        fxrt_backend_enabled = (
+            compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
+            and compilation_config.backend == "inductor"
+            and compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+            and ascend_envs.VLLM_ASCEND_ENABLE_FXRT_BACKEND
+        )
+        if not fxrt_backend_enabled and compilation_config.mode not in [
+            CompilationMode.NONE,
+            CompilationMode.VLLM_COMPILE,
+        ]:
             logger.warning(
                 "NPU does not support compilation mode. mode=%s, action: setting CUDAGraphMode to NONE.",
                 compilation_config.mode,
@@ -547,8 +561,12 @@ class NPUPlatform(Platform):
 
         compilation_config.use_inductor = False
         if compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
-            compilation_config.mode = CompilationMode.NONE
+            if not fxrt_backend_enabled:
+                compilation_config.mode = CompilationMode.NONE
             ascend_config.ascend_compilation_config.enable_npugraph_ex = False
+            if fxrt_backend_enabled:
+                ascend_config.ascend_compilation_config.enable_static_kernel = False
+                vllm_config.additional_config["ascend_compilation_config"]["enable_static_kernel"] = False
         elif compilation_config.cudagraph_mode.requires_piecewise_compilation():
             # Our is_cuda_alike is False so we cannot reuse the assertion of upstream
             assert compilation_config.mode == CompilationMode.VLLM_COMPILE, (

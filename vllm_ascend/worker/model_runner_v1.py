@@ -35,6 +35,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
@@ -2055,7 +2056,13 @@ class NPUModelRunner(GPUModelRunner):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
             hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                num_tokens_padded,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                use_stock_compile=self.with_prefill and not has_encoder_input,
+                **model_kwargs,
             )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -2588,6 +2595,7 @@ class NPUModelRunner(GPUModelRunner):
         positions: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        use_stock_compile: bool = False,
         **model_kwargs: dict[str, Any],
     ):
         assert self.model is not None
@@ -2601,7 +2609,10 @@ class NPUModelRunner(GPUModelRunner):
             "inputs_embeds": inputs_embeds,
             **model_kwargs,
         }
-        run_model = partial(self.model, **model_inputs)
+        if use_stock_compile and self._stock_compiled_call is not None:
+            run_model = partial(self._stock_compiled_call, **model_inputs)
+        else:
+            run_model = partial(self.model, **model_inputs)
 
         if self.enable_enpu:
             # The soft segmentation scenario requires event.record first, then event.wait
@@ -3358,7 +3369,12 @@ class NPUModelRunner(GPUModelRunner):
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
             ):
                 outputs = self._model_forward(
-                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
+                    num_tokens_padded,
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    use_stock_compile=with_prefill,
                 )
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
@@ -3523,7 +3539,37 @@ class NPUModelRunner(GPUModelRunner):
             and mm_config is not None
             and mm_config.is_multimodal_pruning_enabled()
         ) # type: bool
-        
+
+        self._stock_compiled_call = None
+        if self.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE:
+            from vllm.env_override import _apply_constrain_to_fx_strides_patch
+
+            _apply_constrain_to_fx_strides_patch()
+            backend = self.compilation_config.init_backend(self.vllm_config)
+            from vllm_ascend import envs as ascend_envs
+
+            if ascend_envs.VLLM_ASCEND_ENABLE_FXRT_BACKEND:
+                from vllm_ascend.compilation.fxrt_backend import (
+                    wrap_backend_with_fxrt,
+                )
+
+                logger.info(
+                    "Routing STOCK_TORCH_COMPILE prefill to the external "
+                    "fxrt backend (Triton Inductor is bypassed)"
+                )
+                debug_dump_path = self.vllm_config.compile_debug_dump_path()
+                dump_dir = debug_dump_path / "fx_graphs" if debug_dump_path is not None else None
+                backend = wrap_backend_with_fxrt(
+                    backend, dump_dir, "model"
+                )
+            self._stock_compiled_call = torch.compile(
+                self.model._call_impl,
+                fullgraph=True,
+                backend=backend,
+            )
+            compilation_counter.stock_torch_compile_count += 1
+            logger.info("Using stock torch.compile for prefill; decode remains eager")
+
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
